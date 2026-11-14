@@ -17,10 +17,15 @@ pub use jero_kernels_rvv::Aligned128;
 #[cfg(feature = "with-kernels")]
 use jero_kernels_rvv::{
     QuantizedActQ8, RepackedWeight,
-    ime::{TILE_C, TILE_K, TILE_N, gemm_i8_ime, unpack_tq1_0_block_i8, unpack_tq2_0_block_i8},
+    ime::{gemm_i8_ime, unpack_tq1_0_block_i8, unpack_tq2_0_block_i8},
     quant::{read_i2_s_trailer_scale, unpack_i2_s_block_i8},
 };
 
+#[cfg(feature = "with-kernels")]
+pub(crate) use jero_kernels_rvv::ime::{TILE_C, TILE_K, TILE_M, TILE_N};
+
+#[cfg(not(feature = "with-kernels"))]
+pub(crate) const TILE_M: usize = 8;
 #[cfg(not(feature = "with-kernels"))]
 /// Logical N rows per `8x16` weight tile.
 pub const TILE_N: usize = 8;
@@ -747,6 +752,18 @@ impl RepackedTernaryMatrix {
         &self.block_scales
     }
 
+    pub(crate) fn tile_block_i8(&self, nt: usize, blk: usize) -> &[i8] {
+        let b_i8 = Aligned128::slice_as_i8(&self.tiles);
+        let blk_stride = self.block_k_chunks * TILE_BYTES;
+        let idx = (nt * self.blocks_per_row + blk) * blk_stride;
+        &b_i8[idx..idx + blk_stride]
+    }
+
+    pub(crate) fn tile_block_scales(&self, nt: usize, blk: usize) -> &[f32] {
+        let base = (nt * self.blocks_per_row + blk) * TILE_N;
+        &self.block_scales[base..base + TILE_N]
+    }
+
     /// Reconstructs logical weight row `row` into `out` (`out.len() == self.cols()`).
     ///
     /// # Errors
@@ -908,6 +925,26 @@ impl RepackedTernaryMatrix {
         Ok(())
     }
 
+    /// Executes batched multi-token `BitLinear` matrix-matrix product `[M, K] x [N, K]^T -> [M, N]`
+    /// over pre-repacked `128-byte` `8x16` `i8` tiles and a shared
+    /// [`BatchedSubLnActivations`](crate::BatchedSubLnActivations) batch.
+    ///
+    /// Lazily packs `act` into `128-byte`-aligned `8x16` activation tiles once for this block layout,
+    /// amortizing subsequent sibling projections (`Q/K/V` and `Gate/Up`) without repacking.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::TensorBoundsError`] if `act.m() == 0`, `act.cols() != self.cols()`, or
+    /// `out.len()` is not `M * out_rows` with `out_rows <= self.rows()`.
+    pub fn bitlinear_gemm(
+        &self,
+        out: &mut [f32],
+        act: &mut crate::prefill::BatchedSubLnActivations,
+    ) -> Result<(), K3Error> {
+        let _ = crate::prefill::bitlinear_gemm_repacked(out, self, act)?;
+        Ok(())
+    }
+
     /// Executes per-32-element `Q8_0 x Q8_0` matrix-vector multiplication for non-kernel `Q8_0` LM heads.
     #[cfg(not(feature = "with-kernels"))]
     fn gemv_q8_per32_blocks(&self, out: &mut [f32], hidden: &[f32]) -> Result<(), K3Error> {
@@ -1023,7 +1060,7 @@ fn compute_tile_row0_dots(a_blk: &[i8], b_blk: &[i8], k_chunks: usize) -> [i32; 
     }
 }
 
-fn extract_i2s_trailer(
+pub(crate) fn extract_i2s_trailer(
     raw: &[u8],
     payload_bytes: usize,
     view: &TensorView<'_>,
@@ -1047,7 +1084,7 @@ fn extract_i2s_trailer(
     }
 }
 
-fn unpack_source_block(
+pub(crate) fn unpack_source_block(
     quant: QuantType,
     block_raw: &[u8],
     i2_s_scale: f32,
@@ -2012,6 +2049,31 @@ impl BitNetModelCache {
         BitNetRecipe::dispatch_bitlinear(out, &view, act_i8, act_scale)
     }
 
+    pub(crate) fn cached_projection_batched(
+        &mut self,
+        view: &TensorView<'_>,
+        name: &str,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Option<Arc<RepackedTernaryMatrix>>, K3Error> {
+        if !is_block_repack_quant(view.quant()) {
+            return Ok(None);
+        }
+        if !self.populate_on_miss {
+            let identity = TensorIdentity::from_view(view);
+            if let Some(entry) = self.projections.get(name)
+                && entry.identity == identity
+                && entry.matrix.rows() == rows
+                && entry.matrix.cols() == cols
+            {
+                self.stats.weight_hits += 1;
+                return Ok(Some(Arc::clone(&entry.matrix)));
+            }
+            return Ok(None);
+        }
+        self.get_or_repack_projection(name, view, rows, cols)
+    }
+
     fn find_cached_table(
         &self,
         key: &str,
@@ -2356,35 +2418,10 @@ impl BitNetRecipe {
         &self,
         ctx: &mut ExecutionContext<'_>,
         weights: &dyn ModelWeights,
-        mut cache: Option<&mut BitNetModelCache>,
+        cache: Option<&mut BitNetModelCache>,
     ) -> Result<(), K3Error> {
-        let prompt_tokens = ctx.prompt_tokens().to_vec();
-        if prompt_tokens.is_empty() {
-            return Err(K3Error::ContextLengthExceeded {
-                requested_tokens: 0,
-                max_context_tokens: ctx.n_ctx(),
-            });
-        }
-        if let Some(c) = cache.as_deref_mut() {
-            c.ensure_model_anchor(weights)?;
-        }
-        let prompt_len = prompt_tokens.len();
-        let start_pos = ctx.position();
-        let seq_len = start_pos + prompt_len;
-
-        let last_hidden = self.run_tokens_with_cache(
-            &prompt_tokens,
-            start_pos,
-            seq_len,
-            ctx,
-            weights,
-            cache.as_deref_mut(),
-        )?;
-        ctx.advance_position(prompt_len)?;
-        match cache {
-            Some(c) => c.project_lm_head(weights, self, ctx.logits_mut(), &last_hidden, None),
-            None => self.project_lm_head(ctx.logits_mut(), &last_hidden, None, weights),
-        }
+        let _ = self.prefill_step_batched_stats(ctx, weights, cache)?;
+        Ok(())
     }
 
     /// Executes `decode_step` using the caller-provided [`BitNetModelCache`].
@@ -2428,7 +2465,7 @@ impl BitNetRecipe {
     }
 }
 
-const fn is_block_repack_quant(quant: QuantType) -> bool {
+pub(crate) const fn is_block_repack_quant(quant: QuantType) -> bool {
     matches!(
         quant,
         QuantType::TQ1_0 | QuantType::TQ2_0 | QuantType::I2_S | QuantType::Q8_0

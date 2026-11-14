@@ -514,8 +514,9 @@ fn test_wave2_preload_multi_step_zero_reunpack_and_exact_logit_parity() {
         post_stats.unpack_block_calls, initial_unpacks,
         "repeated prefill + 4x decode must perform zero incremental block unpacks"
     );
-    assert!(post_stats.weight_hits >= 14 * 7);
-    assert!(post_stats.norm_hits >= 9 * 7);
+    // 1 batched prefill pass over the 3-token prompt + 4 decode steps = 5 layer-pass hits.
+    assert!(post_stats.weight_hits >= 14 * 5);
+    assert!(post_stats.norm_hits >= 9 * 5);
     assert!(post_stats.lm_head_hits >= 12);
 
     // Verify zero-budget streaming oracle produces identical step-by-step logits.
@@ -826,7 +827,8 @@ fn test_wave2_preload_global_arch_recipe_zero_reunpack() {
     assert_eq!(post_stats.unpack_block_calls, initial_unpacks);
     assert_eq!(post_stats.norm_decodes, load_stats.norm_decodes);
     assert_eq!(post_stats.weight_repacks, load_stats.weight_repacks);
-    assert!(post_stats.weight_hits >= 14 * 4);
+    // 1 batched prefill pass + 2 decode steps = 3 layer-pass hits.
+    assert!(post_stats.weight_hits >= 14 * 3);
 
     // Compare against uncached oracle.
     let mut oracle_cache = BitNetModelCache::with_max_bytes(0);

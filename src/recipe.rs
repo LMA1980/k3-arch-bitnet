@@ -1123,7 +1123,7 @@ impl BitNetRecipe {
 
     /// Dispatches `SubLN` normalization and dynamic int8 quantization.
     #[inline]
-    fn subln(
+    pub(crate) fn subln(
         out_i8: &mut [i8],
         input: &[f32],
         norm_weight: &[f32],
@@ -1377,7 +1377,7 @@ impl BitNetRecipe {
             reason = "with-kernels apply_rope_inplace returns Result"
         )
     )]
-    fn apply_rope_heads(
+    pub(crate) fn apply_rope_heads(
         &self,
         vecs: &mut [f32],
         head_d_even: usize,
