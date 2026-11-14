@@ -1,3 +1,4 @@
+#![cfg(feature = "with-kernels")]
 #![allow(clippy::all, clippy::pedantic, clippy::restriction)]
 //! Hardware Target Benchmark Test for `SpacemiT` K3 (Milestone 4 Epic 2)
 //!
@@ -305,6 +306,12 @@ fn test_target_hardware_full_model_inference() {
         let mut weights = TargetBenchmarkWeights::new();
 
         weights.insert_tensor(
+            "token_embd.weight",
+            QuantType::F32,
+            vec![hidden_dim, vocab_size],
+            create_f32_buffer(vocab_size * hidden_dim, 0.25),
+        );
+        weights.insert_tensor(
             "output_norm.weight",
             QuantType::F32,
             vec![hidden_dim],
@@ -326,25 +333,25 @@ fn test_target_hardware_full_model_inference() {
 
         for l in 0..num_layers {
             weights.insert_tensor(
-                format!("blk.{l}.attn_sub_norm.weight"),
+                format!("blk.{l}.attn_norm.weight"),
                 QuantType::F32,
                 vec![hidden_dim],
                 create_f32_buffer(hidden_dim, 1.0),
             );
             weights.insert_tensor(
-                format!("blk.{l}.attn_output_sub_norm.weight"),
+                format!("blk.{l}.attn_sub_norm.weight"),
                 QuantType::F32,
                 vec![total_q],
                 create_f32_buffer(total_q, 1.0),
             );
             weights.insert_tensor(
-                format!("blk.{l}.ffn_sub_norm.weight"),
+                format!("blk.{l}.ffn_norm.weight"),
                 QuantType::F32,
                 vec![hidden_dim],
                 create_f32_buffer(hidden_dim, 1.0),
             );
             weights.insert_tensor(
-                format!("blk.{l}.ffn_down_sub_norm.weight"),
+                format!("blk.{l}.ffn_sub_norm.weight"),
                 QuantType::F32,
                 vec![ffn_dim],
                 create_f32_buffer(ffn_dim, 1.0),

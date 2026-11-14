@@ -5,7 +5,9 @@ description: "Implement and validate BitNet (bitnet, bitnet-b1.58, and bitnet-25
 
 # `jero-arch-bitnet` Architecture Recipe Invariants
 
-- Implement `jero_core::ArchRecipe` for BitNet architectures (`bitnet`, `bitnet-b1.58`, and `bitnet-25`), enforcing mandatory SubLN (`subln_quantize_absmax_i8`) strictly prior to every `BitLinear` projection (`attn_q`, `attn_k`, `attn_v`, `attn_output`, `ffn_gate`, `ffn_up`, `ffn_down`).
-- Support both `ReLU^2` (`use_relu2: true` via `relu_squared_gate_f32`) and `SwiGLU` (`use_relu2: false` via `swiglu_f32`) gated FFN blocks.
-- Support `QuantType::TQ1_0`, `QuantType::TQ2_0`, and `QuantType::Q8_0` weights, maintaining zero heap expansion and delegating to `jero-kernels-rvv` (`bitlinear_i8_ime` with A100 `smt.vmadot` and `bitlinear_i8_rvv` with X100 RVV).
+- Implement `jero_core::ArchRecipe` for BitNet architectures (`bitnet`, `bitnet-b1.58`, and `bitnet-25`), hydrating hyperparameters via `BitNetRecipe::from_gguf(&GgufFile<'_>)` and validating weights via `validate_model`.
+- Enforce canonical BitNet norm and `SubLN` placement cleanly without fallback loops: `blk.{l}.attn_norm.weight` (`[hidden_dim]`) before Q/K/V, `blk.{l}.attn_sub_norm.weight` (`[total_q]`) before `attn_output`, `blk.{l}.ffn_norm.weight` (`[hidden_dim]`) before gate/up, and `blk.{l}.ffn_sub_norm.weight` (`[ffn_dim]`) before `ffn_down`.
+- Execute full `0..=position` causal GQA via `ExecutionContext::kv_view_mut` (`KvCacheView`) when `KvGeometry` is attached, respecting optional `sliding_window`.
+- Decode `token_embd.weight` across `F32`/`F16`/`BF16`/`Q8_0`/`TQ1_0`/`TQ2_0`/`I2_S`, apply `output_norm.weight` once (no duplicate `SubLN`), and fall back to tied `token_embd.weight` when `output.weight` is absent.
+- Support `QuantType::I2_S`, `TQ1_0`, `TQ2_0`, `Q8_0`, `F32`, `F16`, and `BF16` weights while preserving zero heap allocations inside the layer loop.
 - Use `usize` for tensor slice indexing and memory offsets, and `u32` for architectural hyperparameters.
