@@ -749,6 +749,105 @@ fn test_wave3_prefill_step_with_stats_subln_dedup_and_final_token_lm_head() {
     }
 }
 
+#[test]
+fn test_wave3_compute_logits_false_preserves_reused_buffer_and_overflow_preserves_kv() {
+    let _shared = IME_LOCK
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (recipe, weights) = build_20_5_gqa_model(true, true, false, 19);
+    let mut cached = BitNetModelCache::new();
+    recipe
+        .preload_cache(&weights, &mut cached)
+        .expect("preload cache");
+    let tokens: Vec<u32> = (0..8)
+        .map(|i| u32::try_from((i * 5 + 1) % recipe.vocab_size).unwrap_or(0))
+        .collect();
+    let n_ctx = 32_usize;
+    let geom = KvGeometry::new(
+        recipe.num_layers,
+        recipe.n_heads_kv,
+        recipe.head_dim,
+        n_ctx,
+        None,
+    )
+    .expect("geom");
+
+    let sentinel_val = -123.5_f32;
+    for use_cached in [true, false] {
+        let mut sentinel_logits = vec![sentinel_val; recipe.vocab_size];
+        let mut kv_sentinel = vec![0.0_f32; geom.required_f32_len().expect("kv")];
+        let mut ctx_sentinel = ExecutionContext::new_prefill_chunk(
+            &tokens,
+            n_ctx,
+            0,
+            false,
+            &mut sentinel_logits,
+            &mut kv_sentinel,
+        )
+        .expect("chunk sentinel ctx")
+        .with_kv_geometry(geom)
+        .expect("geom");
+        let stats = recipe
+            .prefill_step_with_stats(
+                &mut ctx_sentinel,
+                &weights,
+                use_cached.then_some(&mut cached),
+            )
+            .expect("skip logits with reused buffer");
+        assert_eq!(stats.lm_head_tokens_projected, 0);
+        assert_eq!(stats.projection_calls, recipe.num_layers * 7);
+        assert_eq!(ctx_sentinel.position(), tokens.len());
+        assert!(
+            sentinel_logits
+                .iter()
+                .all(|&v| v.to_bits() == sentinel_val.to_bits()),
+            "compute_logits=false overwrote reused logits buffer (cached={use_cached})"
+        );
+    }
+
+    // `start_pos + prompt_len > n_ctx` fails before mutating KV storage.
+    let small_n_ctx = 8_usize;
+    let small_geom = KvGeometry::new(
+        recipe.num_layers,
+        recipe.n_heads_kv,
+        recipe.head_dim,
+        small_n_ctx,
+        None,
+    )
+    .expect("small geom");
+    let mut kv_guard = vec![0.0_f32; small_geom.required_f32_len().expect("kv")];
+    let mut guard_logits = vec![sentinel_val; recipe.vocab_size];
+    let mut ctx_overflow =
+        ExecutionContext::new(&tokens[..5], small_n_ctx, &mut guard_logits, &mut kv_guard)
+            .expect("first chunk ctx")
+            .with_kv_geometry(small_geom)
+            .expect("geom");
+    let _ = recipe
+        .prefill_step_with_stats(&mut ctx_overflow, &weights, Some(&mut cached))
+        .expect("first 5 tokens fit within n_ctx=8");
+    assert_eq!(ctx_overflow.position(), 5);
+    let kv_after_first = ctx_overflow.kv_cache_mut().to_vec();
+
+    let overflow_err = recipe
+        .prefill_step_with_stats(&mut ctx_overflow, &weights, Some(&mut cached))
+        .expect_err("second 5-token prefill from pos=5 overflows n_ctx=8");
+    assert!(matches!(
+        overflow_err,
+        K3Error::ContextLengthExceeded {
+            requested_tokens: 10,
+            max_context_tokens: 8,
+        }
+    ));
+    assert_eq!(ctx_overflow.position(), 5);
+    assert!(
+        kv_guard
+            .iter()
+            .zip(&kv_after_first)
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
+        "KV buffer mutated despite n_ctx overflow"
+    );
+}
+
 fn verify_equivalences_for_model(swiglu: bool, with_geometry: bool, use_cache: bool, seed: usize) {
     let (recipe, weights) = build_20_5_gqa_model(swiglu, true, false, seed);
     let tokens: Vec<u32> = (0..17)

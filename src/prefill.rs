@@ -45,7 +45,8 @@ pub struct PrefillSubLnStats {
     pub prompt_tokens: usize,
     /// Total `BitLinear` linear projections dispatched (`7` per transformer layer).
     pub projection_calls: usize,
-    /// Prompt tokens projected through `output_norm` and the LM head (`1` for token `M - 1`).
+    /// Prompt tokens projected through `output_norm` and the LM head (`1` for token `M - 1`,
+    /// or `0` when `compute_logits` is disabled or the logits buffer is empty).
     pub lm_head_tokens_projected: usize,
 }
 
@@ -1262,12 +1263,20 @@ impl BitNetRecipe {
                 max_context_tokens: ctx.n_ctx(),
             });
         }
+        let prompt_len = prompt_tokens.len();
+        let start_pos = ctx.position();
+        let requested_end = start_pos.saturating_add(prompt_len);
+        if requested_end > ctx.n_ctx() {
+            return Err(K3Error::ContextLengthExceeded {
+                requested_tokens: requested_end,
+                max_context_tokens: ctx.n_ctx(),
+            });
+        }
         if let Some(c) = cache.as_deref_mut() {
             c.ensure_model_anchor(weights)?;
         }
 
-        let prompt_len = prompt_tokens.len();
-        let start_pos = ctx.position();
+        let compute_logits = ctx.compute_logits() && !ctx.logits().is_empty();
         let (last_hidden, mut stats) = {
             let mut kv_storage = match ctx.kv_view_mut() {
                 Some(view) => KvStorage::View(view),
@@ -1276,6 +1285,7 @@ impl BitNetRecipe {
             self.run_batched_prefill_with_cache(
                 &prompt_tokens,
                 start_pos,
+                compute_logits,
                 &mut kv_storage,
                 weights,
                 cache.as_deref_mut(),
@@ -1283,11 +1293,15 @@ impl BitNetRecipe {
         };
 
         ctx.advance_position(prompt_len)?;
-        match cache {
-            Some(c) => c.project_lm_head(weights, self, ctx.logits_mut(), &last_hidden, None)?,
-            None => self.project_lm_head(ctx.logits_mut(), &last_hidden, None, weights)?,
+        if compute_logits {
+            match cache {
+                Some(c) => {
+                    c.project_lm_head(weights, self, ctx.logits_mut(), &last_hidden, None)?;
+                }
+                None => self.project_lm_head(ctx.logits_mut(), &last_hidden, None, weights)?,
+            }
+            stats.lm_head_tokens_projected = 1;
         }
-        stats.lm_head_tokens_projected = usize::from(!ctx.logits().is_empty());
         Ok(stats)
     }
 
@@ -1299,6 +1313,7 @@ impl BitNetRecipe {
         &self,
         tokens: &[u32],
         start_pos: usize,
+        compute_logits: bool,
         kv_storage: &mut KvStorage<'_>,
         weights: &dyn ModelWeights,
         mut cache: Option<&mut BitNetModelCache>,
@@ -1534,7 +1549,10 @@ impl BitNetRecipe {
             )?;
         }
 
-        // 8. Output Normalization ONLY for the final token row `M - 1`.
+        // 8. Output Normalization ONLY for the final token row `M - 1` when projecting logits.
+        if !compute_logits {
+            return Ok((Vec::new(), stats));
+        }
         let last_off = (m - 1) * hidden_dim;
         let mut last_hidden = hidden[last_off..last_off + hidden_dim].to_vec();
         if weights.contains_tensor("output_norm.weight") {
