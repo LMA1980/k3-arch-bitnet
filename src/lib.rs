@@ -6,9 +6,11 @@
 //! (`TQ1_0`, `TQ2_0`) for zero-expansion `BitLinear` execution on `A100` (`smt.vmadot`)
 //! and `X100` (RVV) compute clusters per ADR-023 and ADR-024.
 
+pub mod prefill;
 pub mod recipe;
 pub mod repack_cache;
 
+pub use prefill::{BatchedSubLnActivations, PrefillSubLnStats};
 pub use recipe::BitNetRecipe;
 pub use repack_cache::{
     Aligned128, BitLinearActScratch, BitNetCacheStats, BitNetModelCache, BitNetVocabContract,
@@ -366,7 +368,7 @@ mod tests {
         ));
     }
 
-    fn build_i2s_unit_weights() -> MapWeights {
+    fn build_i2s_embd_bytes() -> Vec<u8> {
         let mut embd_f16 = Vec::with_capacity(4 * 128 * 2);
         for tok in 0u16..4 {
             for idx in 0u16..128 {
@@ -379,9 +381,17 @@ mod tests {
                 embd_f16.extend_from_slice(&bits.to_le_bytes());
             }
         }
+        embd_f16
+    }
 
+    fn build_i2s_unit_weights() -> MapWeights {
         let mut weights = MapWeights::default();
-        weights.insert("token_embd.weight", QuantType::F16, vec![128, 4], embd_f16);
+        weights.insert(
+            "token_embd.weight",
+            QuantType::F16,
+            vec![128, 4],
+            build_i2s_embd_bytes(),
+        );
         for (name, dim) in [
             ("output_norm.weight", 128),
             ("blk.0.attn_norm.weight", 128),
@@ -410,20 +420,63 @@ mod tests {
         weights
     }
 
+    fn build_miri_i2s_unit_weights() -> MapWeights {
+        let mut w = MapWeights::default();
+        w.insert(
+            "token_embd.weight",
+            QuantType::F16,
+            vec![128, 4],
+            build_i2s_embd_bytes(),
+        );
+        for (name, dim) in [
+            ("output_norm.weight", 128),
+            ("blk.0.attn_norm.weight", 128),
+            ("blk.0.attn_sub_norm.weight", 32),
+            ("blk.0.ffn_norm.weight", 128),
+            ("blk.0.ffn_sub_norm.weight", 32),
+        ] {
+            w.insert(name, QuantType::F32, vec![dim], make_f32_norm(dim, 1.0));
+        }
+        for (seed, name, rows) in [
+            (1u8, "blk.0.attn_q.weight", 32),
+            (2, "blk.0.attn_k.weight", 16),
+            (3, "blk.0.attn_v.weight", 16),
+            (5, "blk.0.ffn_gate.weight", 32),
+            (6, "blk.0.ffn_up.weight", 32),
+        ] {
+            w.insert(
+                name,
+                QuantType::I2_S,
+                vec![128, rows],
+                make_i2s_block_matrix(rows, 128, seed, 0.25),
+            );
+        }
+        for name in ["blk.0.attn_output.weight", "blk.0.ffn_down.weight"] {
+            // Q8_0 permits 32-column projections while keeping attention/FFN active under Miri.
+            w.insert(name, QuantType::Q8_0, vec![32, 128], vec![0u8; 128 * 34]);
+        }
+        w
+    }
+
     #[test]
     fn test_bitnet_recipe_i2s_kv_view_and_tied_output_linear_scale() {
         let mut recipe = BitNetRecipe::new_b158();
         recipe.num_layers = 1;
         recipe.hidden_dim = 128;
-        recipe.ffn_dim = 128;
-        recipe.n_heads_q = 4;
-        recipe.n_heads_kv = 2;
-        recipe.head_dim = 32;
+        recipe.ffn_dim = if cfg!(miri) { 32 } else { 128 };
+        recipe.n_heads_q = if cfg!(miri) { 2 } else { 4 };
+        recipe.n_heads_kv = if cfg!(miri) { 1 } else { 2 };
+        recipe.head_dim = if cfg!(miri) { 16 } else { 32 };
         recipe.vocab_size = 4;
 
-        let mut weights = build_i2s_unit_weights();
+        let mut weights = if cfg!(miri) {
+            build_miri_i2s_unit_weights()
+        } else {
+            build_i2s_unit_weights()
+        };
 
-        let geom = jero_core::KvGeometry::new(1, 2, 32, 4, None).expect("valid kv geometry");
+        let geom = jero_core::KvGeometry::new(1, recipe.n_heads_kv, recipe.head_dim, 4, None)
+            .expect("valid kv geometry");
         let run_seq = |tokens: &[u32], w: &MapWeights| -> Vec<f32> {
             let mut logits = [0.0f32; 4];
             let mut kv_buf = vec![0.0f32; geom.required_f32_len().expect("kv len")];

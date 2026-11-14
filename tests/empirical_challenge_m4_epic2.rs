@@ -665,38 +665,18 @@ fn test_empirical_zero_allocation_invariant_dynamic() {
     // In execute_token_step, recipe.rs preallocates 22 scratch slices once outside the layer loop.
     // decode_step adds 1 scratch slice in the ternary LM head for absmax quantization, yielding
     // 23 fixed allocations outside the loop.
-    #[cfg(not(feature = "with-kernels"))]
-    {
-        for (&layers, &count) in test_layers.iter().zip(&alloc_counts) {
-            assert_eq!(
-                count, 23,
-                "Under scalar fallback, allocation count for {layers} layers must be exactly 23 \
-                 (22 pre-allocated scratch buffers in execute_token_step + 1 in decode_step LM head). \
-                 d(Allocations)/d(layers) must be strictly 0."
-            );
-        }
-        println!(
-            "PASS: Under scalar fallback, d(Allocations)/d(layers) == 0. Exactly 0 heap allocations occur inside the layer loop."
+    for (&layers, &count) in test_layers.iter().zip(&alloc_counts) {
+        assert_eq!(
+            count, 23,
+            "Allocation count for {layers} layers must remain 23 \
+             (22 pre-allocated scratch buffers in execute_token_step + 1 in decode_step LM head; \
+             upstream gqa_causal_attention_f32 uses stack scratch for seq_len <= 2048). \
+             d(Allocations)/d(layers) must be strictly 0."
         );
     }
-
-    #[cfg(feature = "with-kernels")]
-    {
-        // When linked with jero-kernels-rvv, recipe.rs itself adds 0 allocations inside the loop.
-        // Downstream gqa_causal_attention_f32 allocates 1 score vector per layer (RoPE allocates 0).
-        // Therefore: allocations(L) = 23_base + 1 * L
-        for (&layers, &count) in test_layers.iter().zip(&alloc_counts) {
-            let expected = 23 + layers;
-            assert_eq!(
-                count, expected,
-                "For {layers} layers with jero-kernels-rvv, expected {expected} allocations \
-                 (23 base + 1 per layer from GQA), got {count}."
-            );
-        }
-        println!(
-            "PASS: recipe.rs layer loop adds 0 direct allocations. Exactly 1 allocation per layer occurs in jero-kernels-rvv (GQA)."
-        );
-    }
+    println!(
+        "PASS: d(Allocations)/d(layers) == 0 across all tested depths. Zero heap allocations occur inside the layer loop."
+    );
 }
 
 #[test]
