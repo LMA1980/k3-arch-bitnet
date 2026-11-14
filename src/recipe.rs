@@ -4,6 +4,7 @@
 //! `"bitnet-b1.58"`, and `"bitnet-25"`, with mandatory `SubLN` prior to every
 //! `BitLinear` projection per ADR-023, ADR-024, and ADR-037.
 
+use crate::repack_cache::{BitNetModelCache, BitNetVocabContract};
 use jero_core::{
     ArchRecipe, ExecutionContext, GgufArray, GgufFile, GgufValue, K3Error, KvCacheView,
     ModelMetadata, ModelWeights, QuantType, TensorView,
@@ -17,7 +18,7 @@ use jero_kernels_rvv::{
     swiglu_f32,
 };
 
-enum KvStorage<'a> {
+pub(crate) enum KvStorage<'a> {
     View(KvCacheView<'a>),
     Raw(&'a mut [f32]),
 }
@@ -292,7 +293,7 @@ impl BitNetRecipe {
     }
 
     #[inline]
-    fn convert_f16(bits: u16) -> f32 {
+    pub(crate) fn convert_f16(bits: u16) -> f32 {
         #[cfg(feature = "with-kernels")]
         {
             f16_to_f32_finite(bits)
@@ -323,7 +324,7 @@ impl BitNetRecipe {
     }
 
     #[inline]
-    fn convert_bf16(bits: u16) -> f32 {
+    pub(crate) fn convert_bf16(bits: u16) -> f32 {
         #[cfg(feature = "with-kernels")]
         {
             bf16_to_f32_finite(bits)
@@ -347,7 +348,7 @@ impl BitNetRecipe {
         clippy::too_many_lines,
         reason = "handles multiple quant formats for norm weights"
     )]
-    fn load_norm_weight_slice(
+    pub(crate) fn load_norm_weight_slice(
         weights: &dyn ModelWeights,
         name: &str,
         fallback_name: Option<&str>,
@@ -463,9 +464,8 @@ impl BitNetRecipe {
         Ok(())
     }
 
-    /// Block geometry for `not(with-kernels)` scalar dequantization & dot products.
-    #[cfg(not(feature = "with-kernels"))]
-    const fn quant_block_layout(quant: QuantType) -> Option<(usize, usize, usize)> {
+    /// Block geometry for block-quantized `BitLinear` weights.
+    pub(crate) const fn quant_block_layout(quant: QuantType) -> Option<(usize, usize, usize)> {
         match quant {
             QuantType::I2_S => Some((128, 32, 32)),
             QuantType::TQ1_0 => Some((256, 54, 0)),
@@ -476,7 +476,7 @@ impl BitNetRecipe {
     }
 
     /// Resolves `total_rows` for a weight matrix whose inner width is `expected_cols`.
-    fn matrix_row_col_dims(
+    pub(crate) fn matrix_row_col_dims(
         view: &TensorView<'_>,
         expected_cols: usize,
         min_rows: usize,
@@ -539,7 +539,7 @@ impl BitNetRecipe {
     }
 
     #[cfg(not(feature = "with-kernels"))]
-    fn unpack_i2s_block_i8(block: &[u8; 32], out: &mut [i8; 128]) {
+    pub(crate) fn unpack_i2s_block_i8(block: &[u8; 32], out: &mut [i8; 128]) {
         #[expect(
             clippy::cast_possible_wrap,
             reason = "2-bit ternary code 0..=3 minus 1 fits in i8"
@@ -554,7 +554,7 @@ impl BitNetRecipe {
     }
 
     #[cfg(not(feature = "with-kernels"))]
-    fn extract_i2s_scale(
+    pub(crate) fn extract_i2s_scale(
         raw: &[u8],
         payload_bytes: usize,
         view: &TensorView<'_>,
@@ -582,7 +582,7 @@ impl BitNetRecipe {
     }
 
     #[cfg(not(feature = "with-kernels"))]
-    fn unpack_tq1_0_block_i8(block: &[u8; 54], out: &mut [i8; 256]) -> f32 {
+    pub(crate) fn unpack_tq1_0_block_i8(block: &[u8; 54], out: &mut [i8; 256]) -> f32 {
         let d_bits = u16::from_le_bytes([block[0], block[1]]);
         let scale = Self::convert_f16(d_bits);
         #[expect(
@@ -608,7 +608,7 @@ impl BitNetRecipe {
     }
 
     #[cfg(not(feature = "with-kernels"))]
-    fn unpack_tq2_0_block_i8(block: &[u8; 66], out: &mut [i8; 256]) -> f32 {
+    pub(crate) fn unpack_tq2_0_block_i8(block: &[u8; 66], out: &mut [i8; 256]) -> f32 {
         let d_bits = u16::from_le_bytes([block[0], block[1]]);
         let scale = Self::convert_f16(d_bits);
         #[expect(
@@ -782,7 +782,7 @@ impl BitNetRecipe {
     }
 
     /// Decodes row `row_idx` of a tensor into `out` across `F32`, `F16`, `BF16`, `Q8_0`, `TQ1_0`, `TQ2_0`, and `I2_S`.
-    fn decode_row_f32(
+    pub(crate) fn decode_row_f32(
         view: &TensorView<'_>,
         row_idx: usize,
         out: &mut [f32],
@@ -878,7 +878,7 @@ impl BitNetRecipe {
         clippy::too_many_lines,
         reason = "handles multiple quant formats for BitLinear projections"
     )]
-    fn dispatch_bitlinear(
+    pub(crate) fn dispatch_bitlinear(
         out: &mut [f32],
         weights: &TensorView<'_>,
         act_i8: &[i8],
@@ -955,7 +955,7 @@ impl BitNetRecipe {
                                         reason = "block int32 accumulation fits safely in f32 mantissa"
                                     )]
                                     {
-                                        row_sum += (acc as f32) * scale * act_scale;
+                                        row_sum += (acc as f32) * (scale * act_scale);
                                     }
                                 }
                                 QuantType::TQ2_0 => {
@@ -974,7 +974,7 @@ impl BitNetRecipe {
                                         reason = "block int32 accumulation fits safely in f32 mantissa"
                                     )]
                                     {
-                                        row_sum += (acc as f32) * scale * act_scale;
+                                        row_sum += (acc as f32) * (scale * act_scale);
                                     }
                                 }
                                 QuantType::I2_S => {
@@ -993,7 +993,7 @@ impl BitNetRecipe {
                                         reason = "block int32 accumulation fits safely in f32 mantissa"
                                     )]
                                     {
-                                        row_sum += (acc as f32) * i2s_scale * act_scale;
+                                        row_sum += (acc as f32) * (i2s_scale * act_scale);
                                     }
                                 }
                                 QuantType::Q8_0 => {
@@ -1015,7 +1015,7 @@ impl BitNetRecipe {
                                         reason = "block int32 accumulation fits safely in f32 mantissa"
                                     )]
                                     {
-                                        row_sum += (acc as f32) * scale * act_scale;
+                                        row_sum += (acc as f32) * (scale * act_scale);
                                     }
                                 }
                                 _ => {}
@@ -1186,7 +1186,7 @@ impl BitNetRecipe {
     }
 
     /// Pure absmax symmetric int8 quantization (no `RMSNorm` pass) for already-normalized hidden states.
-    fn quantize_absmax_i8(out_i8: &mut [i8], input: &[f32]) -> Result<f32, K3Error> {
+    pub(crate) fn quantize_absmax_i8(out_i8: &mut [i8], input: &[f32]) -> Result<f32, K3Error> {
         if input.is_empty() || out_i8.len() != input.len() {
             return Err(K3Error::TensorBoundsError {
                 tensor_name: "lm_head_act".to_owned(),
@@ -1418,7 +1418,7 @@ impl BitNetRecipe {
         clippy::too_many_lines,
         reason = "handles tied embeddings, ternary absmax dispatch, and exact f32 row dot products"
     )]
-    fn project_lm_head(
+    pub(crate) fn project_lm_head(
         &self,
         logits: &mut [f32],
         hidden: &[f32],
@@ -1564,6 +1564,7 @@ impl BitNetRecipe {
         seq_len: usize,
         kv_storage: &mut KvStorage<'_>,
         weights: &dyn ModelWeights,
+        mut cache: Option<&mut BitNetModelCache>,
     ) -> Result<Vec<f32>, K3Error> {
         let hidden_dim = self.hidden_dim.max(16);
         let ffn_dim = self.ffn_dim.max(16);
@@ -1580,29 +1581,7 @@ impl BitNetRecipe {
 
         // Pre-allocate scratch buffers once OUTSIDE the layer loop:
         let mut hidden = vec![0.0_f32; hidden_dim];
-        if weights.contains_tensor("token_embd.weight") {
-            let embd = weights.tensor("token_embd.weight")?;
-            let row = usize::try_from(token_id).map_err(|_| K3Error::TensorBoundsError {
-                tensor_name: "token_embd.weight".to_owned(),
-                offset: 0,
-                byte_len: 0,
-                buffer_len: embd.as_bytes().len(),
-                reason: format!("token_id {token_id} exceeds usize"),
-            })?;
-            Self::decode_row_f32(&embd, row, &mut hidden)?;
-        } else if weights.tensor_count() == 0 {
-            #[expect(clippy::cast_precision_loss, reason = "token modulo fits in f32")]
-            let base_val = ((token_id % 17) as f32) * 0.1 + 0.5;
-            hidden.fill(base_val);
-        } else {
-            return Err(K3Error::TensorBoundsError {
-                tensor_name: "token_embd.weight".to_owned(),
-                offset: 0,
-                byte_len: 0,
-                buffer_len: 0,
-                reason: "tensor 'token_embd.weight' not found in weights".to_owned(),
-            });
-        }
+        Self::embed_token_opt(cache.as_deref_mut(), weights, token_id, &mut hidden)?;
 
         // Fixed buffers for layer projections (ZERO heap allocations during layer loop)
         let mut norm_w_hidden = vec![1.0_f32; hidden_dim];
@@ -1639,7 +1618,7 @@ impl BitNetRecipe {
             // -------------------------------------------------------------
             name_buf.clear();
             let _ = write!(&mut name_buf, "blk.{layer}.attn_norm.weight");
-            Self::load_norm_weight_slice(weights, &name_buf, None, &mut norm_w_hidden)?;
+            Self::load_norm_opt(cache.as_deref_mut(), weights, &name_buf, &mut norm_w_hidden)?;
 
             // 1a. SubLN before attn_q
             let scale_q = Self::subln(&mut act_q_i8, &hidden, &norm_w_hidden, eps)?;
@@ -1654,8 +1633,14 @@ impl BitNetRecipe {
             name_buf.clear();
             let _ = write!(&mut name_buf, "blk.{layer}.attn_q.weight");
             if weights.contains_tensor(&name_buf) {
-                let q_tensor = weights.tensor(&name_buf)?;
-                Self::dispatch_bitlinear(&mut q_vec, &q_tensor, &act_q_i8, scale_q)?;
+                Self::dispatch_proj_opt(
+                    cache.as_deref_mut(),
+                    weights,
+                    &name_buf,
+                    &mut q_vec,
+                    &act_q_i8,
+                    scale_q,
+                )?;
             } else if weights.tensor_count() == 0 {
                 for (i, slot) in q_vec.iter_mut().enumerate() {
                     *slot = (f32::from(act_q_i8[i % hidden_dim]) * scale_q) * 0.1 + 0.5;
@@ -1674,8 +1659,14 @@ impl BitNetRecipe {
             name_buf.clear();
             let _ = write!(&mut name_buf, "blk.{layer}.attn_k.weight");
             if weights.contains_tensor(&name_buf) {
-                let k_tensor = weights.tensor(&name_buf)?;
-                Self::dispatch_bitlinear(&mut k_vec, &k_tensor, &act_k_i8, scale_k)?;
+                Self::dispatch_proj_opt(
+                    cache.as_deref_mut(),
+                    weights,
+                    &name_buf,
+                    &mut k_vec,
+                    &act_k_i8,
+                    scale_k,
+                )?;
             } else if weights.tensor_count() == 0 {
                 for (i, slot) in k_vec.iter_mut().enumerate() {
                     *slot = (f32::from(act_k_i8[i % hidden_dim]) * scale_k) * 0.1 + 0.5;
@@ -1694,8 +1685,14 @@ impl BitNetRecipe {
             name_buf.clear();
             let _ = write!(&mut name_buf, "blk.{layer}.attn_v.weight");
             if weights.contains_tensor(&name_buf) {
-                let v_tensor = weights.tensor(&name_buf)?;
-                Self::dispatch_bitlinear(&mut v_vec, &v_tensor, &act_v_i8, scale_v)?;
+                Self::dispatch_proj_opt(
+                    cache.as_deref_mut(),
+                    weights,
+                    &name_buf,
+                    &mut v_vec,
+                    &act_v_i8,
+                    scale_v,
+                )?;
             } else if weights.tensor_count() == 0 {
                 for (i, slot) in v_vec.iter_mut().enumerate() {
                     *slot = (f32::from(act_v_i8[i % hidden_dim]) * scale_v) * 0.1 + 0.5;
@@ -1826,7 +1823,12 @@ impl BitNetRecipe {
             // -------------------------------------------------------------
             name_buf.clear();
             let _ = write!(&mut name_buf, "blk.{layer}.attn_sub_norm.weight");
-            Self::load_norm_weight_slice(weights, &name_buf, None, &mut norm_w_total_q)?;
+            Self::load_norm_opt(
+                cache.as_deref_mut(),
+                weights,
+                &name_buf,
+                &mut norm_w_total_q,
+            )?;
 
             // 4a. Mandatory SubLN before attn_output
             let scale_out = Self::subln(&mut act_out_i8, &attn_out, &norm_w_total_q, eps)?;
@@ -1835,8 +1837,14 @@ impl BitNetRecipe {
             name_buf.clear();
             let _ = write!(&mut name_buf, "blk.{layer}.attn_output.weight");
             if weights.contains_tensor(&name_buf) {
-                let out_tensor = weights.tensor(&name_buf)?;
-                Self::dispatch_bitlinear(&mut o_proj, &out_tensor, &act_out_i8, scale_out)?;
+                Self::dispatch_proj_opt(
+                    cache.as_deref_mut(),
+                    weights,
+                    &name_buf,
+                    &mut o_proj,
+                    &act_out_i8,
+                    scale_out,
+                )?;
                 for (h, o) in hidden.iter_mut().zip(&o_proj) {
                     *h += *o;
                 }
@@ -1859,7 +1867,7 @@ impl BitNetRecipe {
             // -------------------------------------------------------------
             name_buf.clear();
             let _ = write!(&mut name_buf, "blk.{layer}.ffn_norm.weight");
-            Self::load_norm_weight_slice(weights, &name_buf, None, &mut norm_w_hidden)?;
+            Self::load_norm_opt(cache.as_deref_mut(), weights, &name_buf, &mut norm_w_hidden)?;
 
             // 5a. Mandatory SubLN before ffn_gate
             let scale_gate = Self::subln(&mut act_gate_i8, &hidden, &norm_w_hidden, eps)?;
@@ -1871,8 +1879,14 @@ impl BitNetRecipe {
             name_buf.clear();
             let _ = write!(&mut name_buf, "blk.{layer}.ffn_gate.weight");
             if weights.contains_tensor(&name_buf) {
-                let gate_tensor = weights.tensor(&name_buf)?;
-                Self::dispatch_bitlinear(&mut gate, &gate_tensor, &act_gate_i8, scale_gate)?;
+                Self::dispatch_proj_opt(
+                    cache.as_deref_mut(),
+                    weights,
+                    &name_buf,
+                    &mut gate,
+                    &act_gate_i8,
+                    scale_gate,
+                )?;
             } else if weights.tensor_count() == 0 {
                 for (i, slot) in gate.iter_mut().enumerate() {
                     *slot = (f32::from(act_gate_i8[i % hidden_dim]) * scale_gate) * 0.1 + 0.5;
@@ -1891,8 +1905,14 @@ impl BitNetRecipe {
             name_buf.clear();
             let _ = write!(&mut name_buf, "blk.{layer}.ffn_up.weight");
             if weights.contains_tensor(&name_buf) {
-                let up_tensor = weights.tensor(&name_buf)?;
-                Self::dispatch_bitlinear(&mut up, &up_tensor, &act_up_i8, scale_up)?;
+                Self::dispatch_proj_opt(
+                    cache.as_deref_mut(),
+                    weights,
+                    &name_buf,
+                    &mut up,
+                    &act_up_i8,
+                    scale_up,
+                )?;
             } else if weights.tensor_count() == 0 {
                 for (i, slot) in up.iter_mut().enumerate() {
                     *slot = (f32::from(act_up_i8[i % hidden_dim]) * scale_up) * 0.05 + 0.25;
@@ -1948,7 +1968,7 @@ impl BitNetRecipe {
             // -------------------------------------------------------------
             name_buf.clear();
             let _ = write!(&mut name_buf, "blk.{layer}.ffn_sub_norm.weight");
-            Self::load_norm_weight_slice(weights, &name_buf, None, &mut norm_w_ffn)?;
+            Self::load_norm_opt(cache.as_deref_mut(), weights, &name_buf, &mut norm_w_ffn)?;
 
             // 7a. Mandatory SubLN before ffn_down
             let scale_down = Self::subln(&mut act_down_i8, &ffn_inter, &norm_w_ffn, eps)?;
@@ -1957,8 +1977,14 @@ impl BitNetRecipe {
             name_buf.clear();
             let _ = write!(&mut name_buf, "blk.{layer}.ffn_down.weight");
             if weights.contains_tensor(&name_buf) {
-                let down_tensor = weights.tensor(&name_buf)?;
-                Self::dispatch_bitlinear(&mut d_proj, &down_tensor, &act_down_i8, scale_down)?;
+                Self::dispatch_proj_opt(
+                    cache.as_deref_mut(),
+                    weights,
+                    &name_buf,
+                    &mut d_proj,
+                    &act_down_i8,
+                    scale_down,
+                )?;
                 for (h, d) in hidden.iter_mut().zip(&d_proj) {
                     *h += *d;
                 }
@@ -1981,7 +2007,7 @@ impl BitNetRecipe {
         // 8. Output Normalization
         // -------------------------------------------------------------
         if weights.contains_tensor("output_norm.weight") {
-            Self::load_norm_weight_slice(weights, "output_norm.weight", None, &mut norm_w_hidden)?;
+            Self::load_norm_opt(cache, weights, "output_norm.weight", &mut norm_w_hidden)?;
             let sum_sq: f32 = hidden.iter().map(|&x| x * x).sum();
             if sum_sq.is_finite() {
                 #[expect(clippy::cast_precision_loss, reason = "dimension fits in f32")]
@@ -2007,6 +2033,34 @@ impl BitNetRecipe {
         }
 
         Ok(hidden)
+    }
+
+    pub(crate) fn run_tokens_with_cache(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        seq_len: usize,
+        ctx: &mut ExecutionContext<'_>,
+        weights: &dyn ModelWeights,
+        mut cache: Option<&mut BitNetModelCache>,
+    ) -> Result<Vec<f32>, K3Error> {
+        let mut last_hidden = Vec::new();
+        let mut kv_storage = match ctx.kv_view_mut() {
+            Some(view) => KvStorage::View(view),
+            None => KvStorage::Raw(ctx.kv_cache_mut()),
+        };
+        for (i, &tok) in tokens.iter().enumerate() {
+            let pos = start_pos + i;
+            last_hidden = self.execute_token_step(
+                tok,
+                pos,
+                seq_len,
+                &mut kv_storage,
+                weights,
+                cache.as_deref_mut(),
+            )?;
+        }
+        Ok(last_hidden)
     }
 
     fn validate_dimensions(&self, metadata: &ModelMetadata) -> Result<(), K3Error> {
@@ -2164,6 +2218,22 @@ impl ArchRecipe for BitNetRecipe {
             }
         }
 
+        if weights.tensor_count() > 0 {
+            let vocab_contract = BitNetVocabContract {
+                vocab_size: self.vocab_size,
+                eos_token_id: None,
+                eot_token_id: None,
+                end_of_text_token_id: None,
+                eot_piece_token_id: None,
+                token_list_len: None,
+                is_llama3_128k: self.vocab_size == crate::repack_cache::LLAMA3_BITNET_VOCAB_SIZE,
+            };
+            if weights.contains_tensor("token_embd.weight") {
+                vocab_contract.validate_weights(weights, self.hidden_dim)?;
+            }
+            BitNetModelCache::preload_global(self, weights)?;
+        }
+
         Ok(())
     }
 
@@ -2172,33 +2242,13 @@ impl ArchRecipe for BitNetRecipe {
         ctx: &mut ExecutionContext<'_>,
         weights: &dyn ModelWeights,
     ) -> Result<(), K3Error> {
-        let prompt_tokens = ctx.prompt_tokens().to_vec();
-        if prompt_tokens.is_empty() {
-            return Err(K3Error::ContextLengthExceeded {
-                requested_tokens: 0,
-                max_context_tokens: ctx.n_ctx(),
-            });
+        if BitNetModelCache::is_global_active() {
+            BitNetModelCache::with_global(|cache| {
+                self.prefill_step_with_opt_cache(ctx, weights, Some(cache))
+            })
+        } else {
+            self.prefill_step_with_opt_cache(ctx, weights, None)
         }
-        let prompt_len = prompt_tokens.len();
-        let start_pos = ctx.position();
-        let seq_len = start_pos + prompt_len;
-
-        let mut last_hidden = Vec::new();
-        {
-            let mut kv_storage = match ctx.kv_view_mut() {
-                Some(view) => KvStorage::View(view),
-                None => KvStorage::Raw(ctx.kv_cache_mut()),
-            };
-            for (i, &tok) in prompt_tokens.iter().enumerate() {
-                let pos = start_pos + i;
-                last_hidden =
-                    self.execute_token_step(tok, pos, seq_len, &mut kv_storage, weights)?;
-            }
-        }
-
-        ctx.advance_position(prompt_len)?;
-        self.project_lm_head(ctx.logits_mut(), &last_hidden, None, weights)?;
-        Ok(())
     }
 
     fn decode_step(
@@ -2206,24 +2256,12 @@ impl ArchRecipe for BitNetRecipe {
         ctx: &mut ExecutionContext<'_>,
         weights: &dyn ModelWeights,
     ) -> Result<(), K3Error> {
-        let token = ctx
-            .decode_token()
-            .ok_or_else(|| K3Error::CapabilityMismatch {
-                architecture: self.architecture_id().to_owned(),
-                reason: "decode_step called without a staged decode token".to_owned(),
-            })?;
-
-        let pos = ctx.position();
-        let seq_len = pos + 1;
-        let hidden = {
-            let mut kv_storage = match ctx.kv_view_mut() {
-                Some(view) => KvStorage::View(view),
-                None => KvStorage::Raw(ctx.kv_cache_mut()),
-            };
-            self.execute_token_step(token, pos, seq_len, &mut kv_storage, weights)?
-        };
-        ctx.advance_position(1)?;
-        self.project_lm_head(ctx.logits_mut(), &hidden, Some(token), weights)?;
-        Ok(())
+        if BitNetModelCache::is_global_active() {
+            BitNetModelCache::with_global(|cache| {
+                self.decode_step_with_opt_cache(ctx, weights, Some(cache))
+            })
+        } else {
+            self.decode_step_with_opt_cache(ctx, weights, None)
+        }
     }
 }
