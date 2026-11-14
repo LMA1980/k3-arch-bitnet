@@ -160,6 +160,20 @@ fn create_f32_raw(dim: usize, val: f32) -> Vec<u8> {
     raw
 }
 
+fn ternary_mix(seed: usize, r: usize, c: usize) -> i8 {
+    let mut x = (r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (c as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9)
+        ^ (seed as u64).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 27;
+    match x % 3 {
+        0 => -1,
+        1 => 0,
+        _ => 1,
+    }
+}
+
 /// Builds a multi-layer synthetic BitNet weight collection.
 pub fn build_multi_layer_weights(
     num_layers: usize,
@@ -200,70 +214,60 @@ pub fn build_multi_layer_weights(
         "output.weight",
         QuantType::TQ1_0,
         vec![hidden_dim, 16],
-        create_tq1_0_pattern(16, hidden_dim, |r, c| {
-            (((r * 13 + c * 17 + 1) % 3) as i8) - 1
-        }),
+        create_tq1_0_pattern(16, hidden_dim, |r, c| ternary_mix(101, r, c)),
     );
 
     for l in 0..num_layers {
-        // SubLN weights
+        // Canonical RMSNorm and SubLN weights
         weights.insert_tensor(
-            format!("blk.{l}.attn_sub_norm.weight"),
+            format!("blk.{l}.attn_norm.weight"),
             QuantType::F32,
             vec![hidden_dim],
             create_f32_raw(hidden_dim, 1.0 + (l as f32) * 0.05),
         );
         weights.insert_tensor(
-            format!("blk.{l}.attn_output_sub_norm.weight"),
+            format!("blk.{l}.attn_sub_norm.weight"),
             QuantType::F32,
             vec![total_q],
             create_f32_raw(total_q, 1.0),
         );
         weights.insert_tensor(
-            format!("blk.{l}.ffn_sub_norm.weight"),
+            format!("blk.{l}.ffn_norm.weight"),
             QuantType::F32,
             vec![hidden_dim],
             create_f32_raw(hidden_dim, 1.0 + (l as f32) * 0.05),
         );
         weights.insert_tensor(
-            format!("blk.{l}.ffn_down_sub_norm.weight"),
+            format!("blk.{l}.ffn_sub_norm.weight"),
             QuantType::F32,
             vec![ffn_dim],
             create_f32_raw(ffn_dim, 1.0),
         );
 
-        // Projections with heterogeneous patterns
+        // Projections with heterogeneous non-periodic patterns
         weights.insert_tensor(
             format!("blk.{l}.attn_q.weight"),
             QuantType::TQ1_0,
             vec![hidden_dim, total_q],
-            create_tq1_0_pattern(total_q, hidden_dim, |r, c| {
-                (((r * 7 + c * 11 + l * 5 + 1) % 3) as i8) - 1
-            }),
+            create_tq1_0_pattern(total_q, hidden_dim, |r, c| ternary_mix(l * 16 + 1, r, c)),
         );
         weights.insert_tensor(
             format!("blk.{l}.attn_k.weight"),
             QuantType::TQ1_0,
             vec![hidden_dim, total_kv],
-            create_tq1_0_pattern(total_kv, hidden_dim, |r, c| {
-                (((r * 11 + c * 13 + l * 7 + 2) % 3) as i8) - 1
-            }),
+            create_tq1_0_pattern(total_kv, hidden_dim, |r, c| ternary_mix(l * 16 + 2, r, c)),
         );
         weights.insert_tensor(
             format!("blk.{l}.attn_v.weight"),
             QuantType::TQ1_0,
             vec![hidden_dim, total_kv],
-            create_tq1_0_pattern(total_kv, hidden_dim, |r, c| {
-                (((r * 17 + c * 19 + l * 3) % 3) as i8) - 1
-            }),
+            create_tq1_0_pattern(total_kv, hidden_dim, |r, c| ternary_mix(l * 16 + 3, r, c)),
         );
         weights.insert_tensor(
             format!("blk.{l}.attn_output.weight"),
             QuantType::TQ1_0,
             vec![total_q, hidden_dim],
-            create_tq1_0_pattern(hidden_dim, total_q, |r, c| {
-                (((r * 23 + c * 29 + l * 9 + 1) % 3) as i8) - 1
-            }),
+            create_tq1_0_pattern(hidden_dim, total_q, |r, c| ternary_mix(l * 16 + 4, r, c)),
         );
 
         // Gate projection: heterogeneous positive/negative/zero ternary
@@ -271,9 +275,7 @@ pub fn build_multi_layer_weights(
             format!("blk.{l}.ffn_gate.weight"),
             QuantType::TQ1_0,
             vec![hidden_dim, ffn_dim],
-            create_tq1_0_pattern(ffn_dim, hidden_dim, |r, c| {
-                (((r * 31 + c * 37 + l * 13 + 2) % 3) as i8) - 1
-            }),
+            create_tq1_0_pattern(ffn_dim, hidden_dim, |r, c| ternary_mix(l * 16 + 5, r, c)),
         );
 
         // Up projection
@@ -281,9 +283,7 @@ pub fn build_multi_layer_weights(
             format!("blk.{l}.ffn_up.weight"),
             QuantType::TQ1_0,
             vec![hidden_dim, ffn_dim],
-            create_tq1_0_pattern(ffn_dim, hidden_dim, |r, c| {
-                (((r * 41 + c * 43 + l * 17 + 1) % 3) as i8) - 1
-            }),
+            create_tq1_0_pattern(ffn_dim, hidden_dim, |r, c| ternary_mix(l * 16 + 6, r, c)),
         );
 
         // Down projection
@@ -291,9 +291,7 @@ pub fn build_multi_layer_weights(
             format!("blk.{l}.ffn_down.weight"),
             QuantType::TQ1_0,
             vec![ffn_dim, hidden_dim],
-            create_tq1_0_pattern(hidden_dim, ffn_dim, |r, c| {
-                (((r * 47 + c * 53 + l * 19) % 3) as i8) - 1
-            }),
+            create_tq1_0_pattern(hidden_dim, ffn_dim, |r, c| ternary_mix(l * 16 + 7, r, c)),
         );
     }
 
@@ -665,15 +663,15 @@ fn test_empirical_zero_allocation_invariant_dynamic() {
 
     // Verify allocation behavior:
     // In execute_token_step, recipe.rs preallocates 22 scratch slices once outside the layer loop.
-    // decode_step adds 2 scratch slices in the LM head for output projection, yielding exactly
-    // 24 fixed allocations outside the loop.
+    // decode_step adds 1 scratch slice in the ternary LM head for absmax quantization, yielding
+    // 23 fixed allocations outside the loop.
     #[cfg(not(feature = "with-kernels"))]
     {
         for (&layers, &count) in test_layers.iter().zip(&alloc_counts) {
             assert_eq!(
-                count, 24,
-                "Under scalar fallback, allocation count for {layers} layers must be exactly 24 \
-                 (22 pre-allocated scratch buffers in execute_token_step + 2 in decode_step LM head). \
+                count, 23,
+                "Under scalar fallback, allocation count for {layers} layers must be exactly 23 \
+                 (22 pre-allocated scratch buffers in execute_token_step + 1 in decode_step LM head). \
                  d(Allocations)/d(layers) must be strictly 0."
             );
         }
@@ -685,21 +683,18 @@ fn test_empirical_zero_allocation_invariant_dynamic() {
     #[cfg(feature = "with-kernels")]
     {
         // When linked with jero-kernels-rvv, recipe.rs itself adds 0 allocations inside the loop.
-        // Downstream jero-kernels-rvv calls account for:
-        // - apply_rope_inplace: allocates 1 inv_freq vector per head (4 Q heads + 2 KV heads = 6)
-        // - gqa_causal_attention_f32: allocates 1 score vector per layer (1)
-        // Total per layer = 7 allocations.
-        // Therefore: allocations(L) = 24_base + 7 * L
+        // Downstream gqa_causal_attention_f32 allocates 1 score vector per layer (RoPE allocates 0).
+        // Therefore: allocations(L) = 23_base + 1 * L
         for (&layers, &count) in test_layers.iter().zip(&alloc_counts) {
-            let expected = 24 + 7 * layers;
+            let expected = 23 + layers;
             assert_eq!(
                 count, expected,
                 "For {layers} layers with jero-kernels-rvv, expected {expected} allocations \
-                 (24 base + 7 per layer from rope/gqa), got {count}."
+                 (23 base + 1 per layer from GQA), got {count}."
             );
         }
         println!(
-            "PASS: recipe.rs layer loop adds 0 direct allocations. Exactly 7 allocations per layer occur in jero-kernels-rvv (6 RoPE + 1 GQA)."
+            "PASS: recipe.rs layer loop adds 0 direct allocations. Exactly 1 allocation per layer occurs in jero-kernels-rvv (GQA)."
         );
     }
 }
@@ -797,6 +792,7 @@ fn test_empirical_numerical_stability() {
     let total_q = 256;
     let total_kv = 128;
     let vocab_size = 512;
+    #[cfg(feature = "with-kernels")]
     let eps = 1e-5;
 
     // 1. Extreme float stress on SubLN and Activation kernels (when with-kernels is active)
